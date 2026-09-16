@@ -1,0 +1,14 @@
+*.dll
+*.so
+*.exe
+*.bin
+*.npz
+*.onnx
+*.dlc
+__pycache__/
+*.raw
+gpu_data/
+*.glsl.inc
+.gitignore:
+daemon/live_daemon
+daemon/live_daemon_720
