@@ -1,0 +1,2 @@
+# fig1-3 generate from constants embedded in make_figs.py (the published table values). fig4 replots one raw capture from your own samples_*.csv / metrics_*.jsonl captures (not included in this repo; carve_energy.py formats them).
+fig5_quality_comparison.png and menu_fsr4_{on,off}.png are screenshots from the author's own RotTR session (account name redacted), captured manually: no generator script exists for them.
