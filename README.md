@@ -67,5 +67,12 @@ versions: `docs/REPRODUCING.md`. Boundaries: `THIRD_PARTY.md`.
 # 5. on device: sh daemon/launch_production.sh   # knobs: docs/KNOBS.md
 ```
 
+
+## AI-coded notice
+
+This project was developed with heavy use of AI coding, using the open-source
+GLM models 5.3 and 5.3 Flash through the ZCode agent harness, with human
+direction and review throughout.
+
 License: MIT for everything original here (see `LICENSE`, `THIRD_PARTY.md`).
 Contact: [placelessness@protonmail.com](mailto:placelessness@protonmail.com), [github.com/puzzled-pancake](https://github.com/puzzled-pancake); support via [GitHub Sponsors](https://github.com/sponsors/puzzled-pancake) or [Ko-fi](https://ko-fi.com/ratherpuzzled).
