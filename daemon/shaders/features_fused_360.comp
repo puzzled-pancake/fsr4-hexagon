@@ -1,0 +1,287 @@
+// Ported from / derived from AMD FidelityFX SDK compute kernels.
+// Original math (c) AMD, FidelityFX SDK license governs the derived algorithm;
+// the surrounding pipeline is this project's (MIT, see LICENSE).
+#version 310 es
+// FUSED feat+pre0 (one thread per LR pixel
+// computes the feat body VERBATIM for its 2x2 output quad, packs the 8 fp16
+// feature halves per texel into words (the exact packHalf2x16 round-trip the
+// two-pass chain did through SSBO 0), then runs pre0_final's MAC + quant
+// VERBATIM over those words. Deletes the 33MB feature write + 33MB re-read
+// + the whole pre0 dispatch + one barrier. Bit-exact vs the two-pass chain
+// by construction: same expressions, same order, same fp16 rounding points.
+// WEIGHT-ORDER CONTRACT inherited from pre0_final.comp: c10=(x+1,y+0) pairs
+// with w2(f,ky=1,kx=0) and c01=(x+0,y+1) with w2(f,ky=0,kx=1) — TRANSPOSED
+// vs gen_seeds.py's docs; the deployed gpu_data/pass0_wb.raw (md5
+// 0915f25de428aaeee396701e3abfd341) is in the compensating order. Do NOT
+// regenerate the .raw without reconciling.
+// Uniform names MUST match features_real.comp (service queries by name:
+// u_rec sampler unit 1, u_jitter, u_reset, IN_W/IN_H/LR_W/LR_H).
+// Bindings: 1=pre_out (per-slot, bound by service), 2=weights, 9=rpj out,
+// 10=hist in, 12=mvec in, 13=mulr in, 15=compact dist out (1 word/px).
+//
+// Phase-B fused history gather. ABLATION DATA (offline bench):
+// the 4x16-tap SSBO gather = 3.6ms of the 11.3ms fence; mu-law 0.6; rec
+// fetch 0.25. A per-thread 5x5 REGISTER tile was tried FIRST and REJECTED
+// (+5ms — dynamic-indexed arrays spill to scratch on Adreno; see
+// features_fused_r33_rejected.comp). THE FIX: the four quads share one MV
+// texel (mvx = tid.x/2 int-div) so their gather windows are EXACT offsets —
+// floor is exact under +1: tx0_B = tx0_A+1, ty0_C = ty0_A+1. One union walk
+// r=0..4, c=0..4 loads each unique texel ONCE (25 loads vs 64) with STATIC
+// bounds tests only (A: r<4&&c<4, B: r<4&&c>0, C: r>0&&c<4, D: r>0&&c>0 —
+// no dynamic array indexing anywhere). BIT-EXACTNESS: r/c map monotonically
+// to k/j, so every quad's contributions still accumulate in the original
+// k-major j-ascending order; w = wy[k]*wx[j] and v*w keep the original
+// expression shapes; the tile fetch clamp(bx+c) equals the original
+// clamp(tx0_q-1+j) because pre-clamp coords are identical; hx/hy are
+// computed per quad VERBATIM (float(tid.x) + vel.x*float(IN_W) — the
+// product was hoisted only in the rejected variant; here every quad's
+// expression is the original one).
+precision highp float;
+precision highp int;
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(std430, binding = 1) writeonly buffer OutQ { uint outq[]; };
+layout(std430, binding = 2) readonly buffer Weights { uint wb[]; }; // 256 weight words then 8 bias words
+layout(std430, binding = 9) writeonly buffer Repj { uint rpj[]; }; // fp16 RGBA @1080p
+layout(std430, binding = 10) readonly buffer Hist { uint hst[]; }; // fp16 RGBA mu-law @1080p
+layout(std430, binding = 12) readonly buffer Mvec { uint mvec[]; };
+layout(std430, binding = 5) readonly buffer RawLr { uint rawlr[]; }; // raw R11G11B10F (1 word/texel)
+layout(std430, binding = 15) writeonly buffer DistO { uint disto[]; };// compact dist (postA's bftau read)
+
+uniform highp sampler2D u_rec;
+uniform vec2 u_jitter;
+uniform float u_reset;
+uniform float u_expo; /* replaces mulr.comp's bake (was SSBO13) */
+uniform float u_bftau; /* dist write gate (bftau=0 in production = dead traffic) */
+uniform uint IN_W;
+uniform uint IN_H;
+uniform uint LR_W;
+uniform uint LR_H;
+
+vec3 loadHistRaw(uint x, uint y) {
+ uint base = (y * IN_W + x) * 2u;
+ return vec3(unpackHalf2x16(hst[base]), unpackHalf2x16(hst[base + 1u]).x);
+}
+/* inline f11 decode + expo + mu-law, replacing the SSBO13 read (mulr
+ * dispatch deleted). The f11->fp16 bit relocation ((e5|m6)<<4 / (e5|m5)<<5)
+ * is EXACT incl. subnormals/inf (same as the daemon's NEON path); the
+ * mu-law expression is character-identical to mulr.comp; and the result is
+ * round-tripped through packHalf2x16 because SSBO13 stored fp16 — without
+ * this the downstream gaussian would see different bits. */
+vec3 muled_raw(uint t) {
+ vec3 c = vec3(unpackHalf2x16((t & 0x7FFu) << 4u).x,
+ unpackHalf2x16(((t >> 11) & 0x7FFu) << 4u).x,
+ unpackHalf2x16(((t >> 22) & 0x3FFu) << 5u).x) * u_expo;
+ vec3 m = max(vec3(0.1174) * log(1.0 + 150.0 * c), vec3(0.0));
+ vec2 xy = unpackHalf2x16(packHalf2x16(m.xy));
+ float z = unpackHalf2x16(packHalf2x16(vec2(m.z, 0.0))).x;
+ return vec3(xy, z);
+}
+vec3 loadMulr(ivec2 p) {
+ p = clamp(p, ivec2(0), ivec2(int(LR_W) - 1, int(LR_H) - 1));
+ return muled_raw(rawlr[uint(p.y) * LR_W + uint(p.x)]);
+}
+float catmull(float f, uint k) {
+ if (k == 0u) return f * (-0.5 + f * (1.0 - 0.5 * f));
+ if (k == 1u) return 1.0 + f * f * (-2.5 + 1.5 * f);
+ if (k == 2u) return f * (0.5 + f * (2.0 - 1.5 * f));
+ return f * f * (-0.5 + 0.5 * f);
+}
+vec4 upscaled_current(uvec2 tid) {
+ vec2 pos_f = vec2(-0.25) + vec2(tid) * 0.5 + u_jitter;
+ ivec2 pos_i = ivec2(floor(pos_f));
+ vec3 acc = vec3(0.0);
+ float wsum = 0.0;
+ float wmax = 0.0;
+ for (int dy = 0; dy < 2; ++dy) {
+ for (int dx = 0; dx < 2; ++dx) {
+ ivec2 pi = pos_i + ivec2(dx, dy);
+ mediump vec2 d = (vec2(pi) - pos_f) * 2.0;
+ mediump float w = exp2((dot(d, d) * (-0.5 / (0.47 * 0.47))) * 1.4426950409);
+ ivec2 p = clamp(pi, ivec2(0), ivec2(int(LR_W) - 1, int(LR_H) - 1));
+ vec3 c = loadMulr(p);
+ acc += c * w;
+ wsum += w;
+ wmax = max(wmax, w);
+ }
+ }
+ return vec4(acc / wsum, wmax);
+}
+
+/* per-quad catmull weight prep — the ORIGINAL statements from the
+ * gather branch (sx/sy, tx0/ty0, fx/fy + the wx/wy loops) VERBATIM. txh/tyh
+ * are gone: the clamping moved into the union-walk's tile fetch, which is
+ * provably identical (see header). */
+void gather_prep(float hx, float hy, out float wx[4], out float wy[4]) {
+ float sx = hx + 0.5; float sy = hy + 0.5;
+ float tx0 = floor(sx - 0.5); float ty0 = floor(sy - 0.5);
+ float fx = sx - (tx0 + 0.5); float fy = sy - (ty0 + 0.5);
+ for (int j = 0; j < 4; ++j) wx[j] = catmull(fx, uint(j));
+ for (int k = 0; k < 4; ++k) wy[k] = catmull(fy, uint(k));
+}
+
+/* feat body VERBATIM from features_real.comp (pre-hoisted form) minus the
+ * gather (now fused per-thread in main). history arrives pre-computed for
+ * the onscreen case; every other expression is character-identical. */
+void feat_px(uvec2 tid, vec2 vel, bool mv_ok, bool onscreen, vec3 history,
+ out uint o0, out uint o1, out uint o2, out uint o3) {
+ vec4 upsc = upscaled_current(tid);
+ vec3 cur = upsc.rgb;
+ float center_w = upsc.a;
+
+ float hx = float(tid.x) + vel.x * float(IN_W);
+ float hy = float(tid.y) + vel.y * float(IN_H);
+
+ vec4 rec = vec4(0.0);
+ if (u_reset > 0.5) {
+ history = cur;
+ } else if (onscreen) {
+ vec2 uv = (vec2(hx, hy) + 0.5) / vec2(IN_W, IN_H);
+ rec = texture(u_rec, uv);
+ }
+
+ float tsw = 0.1 * center_w;
+ vec3 rect = (u_reset > 0.5) ? cur
+: (mv_ok ? (tsw * cur + (1.0 - tsw) * history): vec3(0.0));
+
+ float yin = cur.r * 0.2126 + cur.g * 0.7152 + cur.b * 0.0722;
+ float yh = rect.r * 0.2126 + rect.g * 0.7152 + rect.b * 0.0722;
+ float cb_in = (cur.b - yin) / 1.8556; float cr_in = (cur.r - yin) / 1.5748;
+ float cb_h = (rect.b - yh) / 1.8556; float cr_h = (rect.r - yh) / 1.5748;
+ float dist = sqrt((cb_in - cb_h) * (cb_in - cb_h) + (cr_in - cr_h) * (cr_in - cr_h) + 1e-6);
+
+ float n0 = 2.0 * yin - 1.0;
+ float n1 = 2.0 * yh - 1.0;
+ vec4 rn = 2.0 * rec - 1.0;
+
+ o0 = packHalf2x16(vec2(n0, n1));
+ o1 = packHalf2x16(vec2(dist, rn.x));
+ o2 = packHalf2x16(vec2(rn.y, rn.z));
+ o3 = packHalf2x16(vec2(rn.w, 0.0));
+
+ uint rbase = (tid.y * IN_W + tid.x) * 2u;
+ rpj[rbase] = packHalf2x16(rect.xy);
+ rpj[rbase + 1u] = packHalf2x16(vec2(rect.z, 1.0));
+
+ if (u_bftau > 0.0)
+ disto[tid.y * IN_W + tid.x] = packHalf2x16(vec2(dist, 0.0));
+}
+
+/* ---- pre0 helpers VERBATIM from pre0_final.comp (binding 2 weights) ---- */
+vec2 w2(uint f, uint ky, uint kx, uint c2) {
+ return unpackHalf2x16(wb[f * 16u + (ky * 2u + kx) * 4u + c2]);
+}
+float biasAt(uint f) {
+ vec2 v = unpackHalf2x16(wb[256u + (f >> 1u)]);
+ return (f & 1u) == 0u ? v.x: v.y;
+}
+uint pack4(int b0, int b1, int b2, int b3) {
+ return (uint(b0) & 0xffu)
+ | ((uint(b1) & 0xffu) << 8u)
+ | ((uint(b2) & 0xffu) << 16u)
+ | ((uint(b3) & 0xffu) << 24u);
+}
+const float RCP_S = 66.13756614; /* arm: 1/0.01512 (the pc-rebuild runtime input scale — VERIFY from the init print) */ /* production: 1/0.0150019 (bin_cfnhwc). The pc-rebuild couple (bin_pc_a8 + 66.13756614 = 1/0.01512) is staged. */
+int quant1(float acc, float bias) {
+ float v = (acc + bias) * RCP_S;
+ return int(clamp(roundEven(v), -128.0, 127.0));
+}
+
+void main() {
+ uvec2 p = gl_GlobalInvocationID.xy;
+ if (p.x >= LR_W || p.y >= LR_H) return;
+
+ uint x0 = 2u * p.x, x1 = 2u * p.x + 1u;
+ uint y0 = 2u * p.y, y1 = 2u * p.y + 1u;
+
+ /* ONE MV read + one mv_ok per thread (the four quads share the
+ * texel: tid.x/2 integer division). hx/hy per quad below stay VERBATIM. */
+ vec2 vel = unpackHalf2x16(mvec[p.y * LR_W + p.x]);
+ bool mv_ok = !isnan(vel.x) && !isnan(vel.y) && !isinf(vel.x) && !isinf(vel.y)
+ && abs(vel.x) < 1e6 && abs(vel.y) < 1e6;
+
+ /* ---- fused history gather: per-quad VERBATIM prep, one union walk
+ * over the 5x5 shared window (25 loads vs 64; static bounds tests; the
+ * accumulation order per quad is unchanged: k-major, j-ascending) ---- */
+ vec3 histA = vec3(0.0), histB = vec3(0.0), histC = vec3(0.0), histD = vec3(0.0);
+ bool onsA = false, onsB = false, onsC = false, onsD = false;
+ if (u_reset <= 0.5 && mv_ok) {
+ float hxA = float(x0) + vel.x * float(IN_W);
+ float hyA = float(y0) + vel.y * float(IN_H);
+ float hxB = float(x1) + vel.x * float(IN_W);
+ float hyB = float(y0) + vel.y * float(IN_H);
+ float hxC = float(x0) + vel.x * float(IN_W);
+ float hyC = float(y1) + vel.y * float(IN_H);
+ float hx1 = float(x1) + vel.x * float(IN_W);
+ float hy1 = float(y1) + vel.y * float(IN_H);
+ onsA = hxA >= 0.0 && hxA <= float(IN_W - 1u) && hyA >= 0.0 && hyA <= float(IN_H - 1u);
+ onsB = hxB >= 0.0 && hxB <= float(IN_W - 1u) && hyB >= 0.0 && hyB <= float(IN_H - 1u);
+ onsC = hxC >= 0.0 && hxC <= float(IN_W - 1u) && hyC >= 0.0 && hyC <= float(IN_H - 1u);
+ onsD = hx1 >= 0.0 && hx1 <= float(IN_W - 1u) && hy1 >= 0.0 && hy1 <= float(IN_H - 1u);
+ if (onsA || onsB || onsC || onsD) {
+ float wxA[4], wyA[4], wxB[4], wyB[4], wxC[4], wyC[4], wxD[4], wyD[4];
+ gather_prep(hxA, hyA, wxA, wyA);
+ gather_prep(hxB, hyB, wxB, wyB);
+ gather_prep(hxC, hyC, wxC, wyC);
+ gather_prep(hx1, hy1, wxD, wyD);
+ /* window base = A's top-left tap: (floor(hxA)-1, floor(hyA)-1).
+ * A's taps are (bx+c, by+r) with c=j, r=k; B's c=j+1; C's r=k+1;
+ * D's both. Valid for any onscreen quad: its pre-clamp taps lie
+ * inside [bx, bx+4]x[by, by+4] (floor is exact under +1). */
+ int bx = int(floor(hxA)) - 1;
+ int by = int(floor(hyA)) - 1;
+ vec3 hA = vec3(0.0), hB = vec3(0.0), hC = vec3(0.0), hD = vec3(0.0);
+ float tA = 0.0, tB = 0.0, tC = 0.0, tD = 0.0;
+ for (int r = 0; r < 5; ++r) {
+ uint cy = uint(clamp(by + r, 0, int(IN_H) - 1));
+ for (int c = 0; c < 5; ++c) {
+ vec3 v = loadHistRaw(uint(clamp(bx + c, 0, int(IN_W) - 1)), cy);
+ if (r < 4 && c < 4 && onsA) { float w = wyA[r] * wxA[c]; tA += w; hA += v * w; }
+ if (r < 4 && c > 0 && onsB) { float w = wyB[r] * wxB[c - 1]; tB += w; hB += v * w; }
+ if (r > 0 && c < 4 && onsC) { float w = wyC[r - 1] * wxC[c]; tC += w; hC += v * w; }
+ if (r > 0 && c > 0 && onsD) { float w = wyD[r - 1] * wxD[c - 1]; tD += w; hD += v * w; }
+ }
+ }
+ if (onsA) histA = max(hA / tA, vec3(0.0));
+ if (onsB) histB = max(hB / tB, vec3(0.0));
+ if (onsC) histC = max(hC / tC, vec3(0.0));
+ if (onsD) histD = max(hD / tD, vec3(0.0));
+ }
+ }
+
+ uint A0,A1,A2,A3, B0,B1,B2,B3, C0,C1,C2,C3, D0,D1,D2,D3;
+ feat_px(uvec2(x0, y0), vel, mv_ok, onsA, histA, A0, A1, A2, A3);
+ feat_px(uvec2(x1, y0), vel, mv_ok, onsB, histB, B0, B1, B2, B3); // pre0's c10 = (x+1, y+0)
+ feat_px(uvec2(x0, y1), vel, mv_ok, onsC, histC, C0, C1, C2, C3); // pre0's c01 = (x+0, y+1)
+ feat_px(uvec2(x1, y1), vel, mv_ok, onsD, histD, D0, D1, D2, D3);
+
+ vec2 c00[4], c10[4], c01[4], c11[4];
+ c00[0] = unpackHalf2x16(A0); c00[1] = unpackHalf2x16(A1);
+ c00[2] = unpackHalf2x16(A2); c00[3] = unpackHalf2x16(A3);
+ c10[0] = unpackHalf2x16(B0); c10[1] = unpackHalf2x16(B1);
+ c10[2] = unpackHalf2x16(B2); c10[3] = unpackHalf2x16(B3);
+ c01[0] = unpackHalf2x16(C0); c01[1] = unpackHalf2x16(C1);
+ c01[2] = unpackHalf2x16(C2); c01[3] = unpackHalf2x16(C3);
+ c11[0] = unpackHalf2x16(D0); c11[1] = unpackHalf2x16(D1);
+ c11[2] = unpackHalf2x16(D2); c11[3] = unpackHalf2x16(D3);
+
+ int q[16];
+ for (uint f = 0u; f < 16u; ++f) {
+ vec2 acc = vec2(0.0);
+ acc += w2(f, 0u, 0u, 0u) * c00[0] + w2(f, 0u, 0u, 1u) * c00[1]
+ + w2(f, 0u, 0u, 2u) * c00[2] + w2(f, 0u, 0u, 3u) * c00[3];
+ acc += w2(f, 1u, 0u, 0u) * c10[0] + w2(f, 1u, 0u, 1u) * c10[1]
+ + w2(f, 1u, 0u, 2u) * c10[2] + w2(f, 1u, 0u, 3u) * c10[3];
+ acc += w2(f, 0u, 1u, 0u) * c01[0] + w2(f, 0u, 1u, 1u) * c01[1]
+ + w2(f, 0u, 1u, 2u) * c01[2] + w2(f, 0u, 1u, 3u) * c01[3];
+ acc += w2(f, 1u, 1u, 0u) * c11[0] + w2(f, 1u, 1u, 1u) * c11[1]
+ + w2(f, 1u, 1u, 2u) * c11[2] + w2(f, 1u, 1u, 3u) * c11[3];
+ q[f] = quant1(acc.x + acc.y, biasAt(f));
+ }
+
+ uint base = (p.y * LR_W + p.x) * 4u;
+ outq[base + 0u] = pack4(q[0], q[1], q[2], q[3]);
+ outq[base + 1u] = pack4(q[4], q[5], q[6], q[7]);
+ outq[base + 2u] = pack4(q[8], q[9], q[10], q[11]);
+ outq[base + 3u] = pack4(q[12], q[13], q[14], q[15]);
+}

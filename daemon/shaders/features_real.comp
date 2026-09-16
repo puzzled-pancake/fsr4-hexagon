@@ -1,0 +1,198 @@
+// Ported from / derived from AMD FidelityFX SDK compute kernels.
+// Original math (c) AMD, FidelityFX SDK license governs the derived algorithm;
+// the surrounding pipeline is this project's (MIT, see LICENSE).
+#version 310 es
+// FSR4 feature build — REAL semantics port of AMD pre_common.hlsli +
+// mlsr_optimized_includes.hlsli (FidelityFX SDK 2.0, fsr4 v07):
+// ch0 = 2*Y(cur)-1 cur = Gaussian 4-tap upscale of ApplyMuLaw(LR*exposure)
+// at the JITTERED LR position; .a = max tap weight
+// ch1 = 2*Y(hist)-1 hist = CatmullRom warp of prev OUTPUT (mu-law domain)
+// then rectified: 0.1*centerW*cur + (1-0.1*centerW)*hist
+// ch2 = chroma distance sqrt(dCb^2+dCr^2+1e-6) (raw)
+// ch3-6 = 2*rec[0..3]-1 bilinear-warped recurrent (sigmoid domain [0,1])
+// ch7 = 0
+// Also writes the RECTIFIED history RGB to SSBO 9 (the post-pass blend source,
+// replacing the daemon-synthesized reproj).
+// Textures: 0 = hist (RGBA16F, MU-LAW domain, prev model color), 1 = rec, 2 = lr.
+// SSBO: 12 = mvec, 0 = out features (8 fp16/texel @1080p), 9 = reproj color out.
+precision highp float;
+precision highp int;
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(std430, binding = 0) writeonly buffer OutF { uint outf[]; };
+layout(std430, binding = 9) writeonly buffer Repj { uint rpj[]; }; // fp16 RGBA @1080p
+layout(std430, binding = 10) readonly buffer Hist { uint hst[]; }; // fp16 RGBA mu-law @1080p
+layout(std430, binding = 12) readonly buffer Mvec { uint mvec[]; };
+layout(std430, binding = 13) readonly buffer Mulr { uint mlr[]; }; // mu-law'd LR (mulr.comp)
+layout(std430, binding = 15) writeonly buffer DistO { uint disto[]; }; // compact dist (1 word/px, postA bftau read)
+
+uniform highp sampler2D u_hist;
+uniform highp sampler2D u_rec;
+uniform highp sampler2D u_lr;
+uniform vec2 u_jitter; // current frame jitter, LR pixels
+uniform float u_reset; // cut-reset: seed history with current, rec=0
+
+uniform uint IN_W;
+uniform uint IN_H;
+uniform uint LR_W;
+uniform uint LR_H;
+
+vec3 applyMuLaw(vec3 rgb) {
+ return max(vec3(0.1174) * log(1.0 + 150.0 * rgb), vec3(0.0));
+}
+
+/* history read directly from SSBO 10 (post_real's mu-law write) */
+vec3 loadHist(ivec2 p) {
+ p = clamp(p, ivec2(0), ivec2(int(IN_W) - 1, int(IN_H) - 1));
+ uint base = (uint(p.y) * IN_W + uint(p.x)) * 2u;
+ return vec3(unpackHalf2x16(hst[base]), unpackHalf2x16(hst[base + 1u]).x);
+}
+/* hoist: UNCLAMPED fetch for callers that pre-clamped (the CatmullRom
+ * taps) — same bits as loadHist for in-range inputs, minus 2 clamps + 2
+ * int->uint conversions per tap x 16 taps */
+vec3 loadHistRaw(uint x, uint y) {
+ uint base = (y * IN_W + x) * 2u;
+ return vec3(unpackHalf2x16(hst[base]), unpackHalf2x16(hst[base + 1u]).x);
+}
+/* perf: mu-law'd LR (SSBO 13, exposure baked by mulr.comp) — the old
+ * per-tap applyMuLaw did ~8.3M log() per frame at 4 taps x 2.07M pixels */
+vec3 loadMulr(ivec2 p) {
+ p = clamp(p, ivec2(0), ivec2(int(LR_W) - 1, int(LR_H) - 1));
+ uint base = (uint(p.y) * LR_W + uint(p.x)) * 2u;
+ return vec3(unpackHalf2x16(mlr[base]), unpackHalf2x16(mlr[base + 1u]).x);
+}
+
+float catmull(float f, uint k) {
+ if (k == 0u) return f * (-0.5 + f * (1.0 - 0.5 * f));
+ if (k == 1u) return 1.0 + f * f * (-2.5 + 1.5 * f);
+ if (k == 2u) return f * (0.5 + f * (2.0 - 1.5 * f));
+ return f * f * (-0.5 + 0.5 * f);
+}
+
+/* Gaussian-weighted 2x2-tap upscale of the mu-law'd LR at the jittered
+ * position (mlsr_optimized_includes: input_pos_f = -0.5 + inv/2 + tid*inv
+ * + jitter; weight = exp((scale*dist)^2 * -0.5/0.47^2), dist in LR px).
+ * Returns rgb = upscale, a = max tap weight ("center weight"). */
+vec4 upscaled_current(uvec2 tid) {
+ vec2 pos_f = vec2(-0.25) + vec2(tid) * 0.5 + u_jitter;
+ ivec2 pos_i = ivec2(floor(pos_f));
+ vec3 acc = vec3(0.0);
+ float wsum = 0.0;
+ float wmax = 0.0;
+ for (int dy = 0; dy < 2; ++dy) {
+ for (int dx = 0; dx < 2; ++dx) {
+ /* weight from the UNCLAMPED tap position (SDK
+ * mlsr:80-93 clamps only the color fetch) — clamping first
+ * skewed border tap weights and the rectification weight */
+ ivec2 pi = pos_i + ivec2(dx, dy);
+ mediump vec2 d = (vec2(pi) - pos_f) * 2.0; // * scale (2x); fp16 math
+ mediump float w = exp2((dot(d, d) * (-0.5 / (0.47 * 0.47))) * 1.4426950409);
+ ivec2 p = clamp(pi, ivec2(0), ivec2(int(LR_W) - 1, int(LR_H) - 1));
+ vec3 c = loadMulr(p); // baked mu-law (mulr.comp)
+ acc += c * w;
+ wsum += w;
+ wmax = max(wmax, w);
+ }
+ }
+ return vec4(acc / wsum, wmax);
+}
+
+void main() {
+ uvec2 tid = gl_GlobalInvocationID.xy;
+ if (tid.x >= IN_W || tid.y >= IN_H) return;
+
+ vec4 upsc = upscaled_current(tid);
+ vec3 cur = upsc.rgb;
+ float center_w = upsc.a;
+
+ uint mvx = uint(tid.x / 2u); uint mvy = uint(tid.y / 2u);
+ vec2 vel = unpackHalf2x16(mvec[mvy * LR_W + mvx]); // LR px / frame
+
+ /* SDK local_disocclusion_user — NaN/Inf/>1e6 velocity
+ * forces the disocclusion path (history 0, recurrent 0, reproj 0);
+ * without this a garbage MV leaves a faint current-frame ghost */
+ bool mv_ok = !isnan(vel.x) && !isnan(vel.y) && !isinf(vel.x) && !isinf(vel.y)
+ && abs(vel.x) < 1e6 && abs(vel.y) < 1e6;
+
+ /* history warp: display px + velocity*displaySize (NO jitter — FSR4
+ * convention: MVs are unjittered, jitter cancellation flag off) */
+ float hx = float(tid.x) + vel.x * float(IN_W);
+ float hy = float(tid.y) + vel.y * float(IN_H);
+ bool onscreen = mv_ok && hx >= 0.0 && hx <= float(IN_W - 1u) && hy >= 0.0 && hy <= float(IN_H - 1u);
+
+ vec3 history = vec3(0.0);
+ vec4 rec = vec4(0.0);
+ if (u_reset > 0.5) {
+ /* cut-reset (SDK pre_common:156-177): seed history WITH the
+ * current color, zero the recurrent, skip reprojection+rectification */
+ history = cur;
+ } else if (onscreen) {
+ /* FIX: the SDK anchors the CatmullRom at the TEXEL
+ * CENTER — pre_common:171-179 converts to UV as (hx+0.5)/size and
+ * MJP's sampler multiplies back by size. Without the +0.5 the warp
+ * samples at phase 0.5 under zero motion = a recursive low-pass on
+ * the whole history chain (blurred fixed point, inflated dist,
+ * depressed model blend). At integer hx this now reproduces the
+ * SDK's exact-copy behavior (fx = frac(hx) = 0 -> unit weight). */
+ float sx = hx + 0.5; float sy = hy + 0.5;
+ float tx0 = floor(sx - 0.5); float ty0 = floor(sy - 0.5);
+ float fx = sx - (tx0 + 0.5); float fy = sy - (ty0 + 0.5);
+ /* hoist: txh[]/wx[] depend only on j, tyh[]/wy[] only on k —
+ * the old nested form recomputed 16 wx polys + 32 clamps per pixel.
+ * Values and accumulation order (k-major, j-minor) unchanged. */
+ float wx[4]; int txh[4]; float wy[4]; int tyh[4];
+ for (int j = 0; j < 4; ++j) {
+ wx[j] = catmull(fx, uint(j));
+ txh[j] = clamp(int(tx0) - 1 + j, 0, int(IN_W) - 1);
+ }
+ for (int k = 0; k < 4; ++k) {
+ wy[k] = catmull(fy, uint(k));
+ tyh[k] = clamp(int(ty0) - 1 + k, 0, int(IN_H) - 1);
+ }
+ vec3 hacc = vec3(0.0); float tot = 0.0;
+ for (int k = 0; k < 4; ++k) {
+ for (int j = 0; j < 4; ++j) {
+ float wgt = wy[k] * wx[j];
+ tot += wgt;
+ hacc += loadHistRaw(uint(txh[j]), uint(tyh[k])) * wgt;
+ }
+ }
+ history = max(hacc / tot, vec3(0.0));
+ vec2 uv = (vec2(hx, hy) + 0.5) / vec2(IN_W, IN_H);
+ rec = texture(u_rec, uv);
+ }
+
+ /* the ONLY rectification in FSR4: 0.1 * centerWeight toward current.
+ * Invalid-MV disocclusion skips it entirely (rect = 0, like the SDK's
+ * rw_reprojected_color = 0); offscreen-but-valid keeps rect-of-zero;
+ * cut-reset: rect = history = current (rectification skipped). */
+ float tsw = 0.1 * center_w;
+ vec3 rect = (u_reset > 0.5) ? cur
+: (mv_ok ? (tsw * cur + (1.0 - tsw) * history): vec3(0.0));
+
+ /* YCbCr (mu-law domain) + chroma distance */
+ float yin = cur.r * 0.2126 + cur.g * 0.7152 + cur.b * 0.0722;
+ float yh = rect.r * 0.2126 + rect.g * 0.7152 + rect.b * 0.0722;
+ float cb_in = (cur.b - yin) / 1.8556; float cr_in = (cur.r - yin) / 1.5748;
+ float cb_h = (rect.b - yh) / 1.8556; float cr_h = (rect.r - yh) / 1.5748;
+ float dist = sqrt((cb_in - cb_h) * (cb_in - cb_h) + (cr_in - cr_h) * (cr_in - cr_h) + 1e-6);
+
+ float n0 = 2.0 * yin - 1.0;
+ float n1 = 2.0 * yh - 1.0;
+ vec4 rn = 2.0 * rec - 1.0;
+
+ uint base = (tid.y * IN_W + tid.x) * 4u;
+ outf[base + 0u] = packHalf2x16(vec2(n0, n1));
+ outf[base + 1u] = packHalf2x16(vec2(dist, rn.x));
+ outf[base + 2u] = packHalf2x16(vec2(rn.y, rn.z));
+ outf[base + 3u] = packHalf2x16(vec2(rn.w, 0.0));
+
+ /* compact dist mirror — postA reads this instead of word 4n+1 of
+ * SSBO 0 (same dist bits), so the fused path and this path share one
+ * postA. Kept here for the FSR4_FUSE=0 fallback only. */
+ disto[tid.y * IN_W + tid.x] = packHalf2x16(vec2(dist, 0.0));
+
+ uint rbase = (tid.y * IN_W + tid.x) * 2u;
+ rpj[rbase] = packHalf2x16(rect.xy);
+ rpj[rbase + 1u] = packHalf2x16(vec2(rect.z, 1.0));
+}

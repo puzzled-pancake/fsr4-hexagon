@@ -1,0 +1,26 @@
+// Ported from / derived from AMD FidelityFX SDK compute kernels.
+// Original math (c) AMD, FidelityFX SDK license governs the derived algorithm;
+// the surrounding pipeline is this project's (MIT, see LICENSE).
+#version 310 es
+// perf: precompute the mu-law'd LR once per frame (SSBO 5 -> SSBO 13).
+// post_real's 3x3 kernel applied applyMuLaw per tap = ~18M log() per frame;
+// this 540p pass does ~0.5M and post reads the baked values instead.
+// Baked exposure = 1.0 (pinned — revisit when the exposure passthrough lands).
+precision highp float;
+precision highp int;
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(std430, binding = 5) readonly buffer Lrc { uint lrc[]; }; // fp16 RGBA raw LR
+layout(std430, binding = 13) writeonly buffer Mulr { uint mlr[]; }; // fp16 RGB mu-law
+
+uniform float u_expo; // frame exposure (1.0 = off; SPD-style when auto)
+
+void main() {
+ uvec2 tid = gl_GlobalInvocationID.xy;
+ if (tid.x >= 960u || tid.y >= 540u) return;
+ uint base = (tid.y * 960u + tid.x) * 2u;
+ vec3 c = vec3(unpackHalf2x16(lrc[base]), unpackHalf2x16(lrc[base + 1u]).x) * u_expo;
+ vec3 m = max(vec3(0.1174) * log(1.0 + 150.0 * c), vec3(0.0));
+ mlr[base] = packHalf2x16(m.xy);
+ mlr[base + 1u] = packHalf2x16(vec2(m.z, 1.0));
+}

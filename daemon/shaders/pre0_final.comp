@@ -1,0 +1,96 @@
+// Ported from / derived from AMD FidelityFX SDK compute kernels.
+// Original math (c) AMD, FidelityFX SDK license governs the derived algorithm;
+// the surrounding pipeline is this project's (MIT, see LICENSE).
+#version 310 es
+// FSR4 pass-0 pre kernel (Adreno GLES port of fsr4_model_v07_i8_pass0 / sim pass0).
+// 7(+1 pad)-channel fp16 features at output res -> int8[960,540,16] @ 0.014884727.
+// Features buffer: uint words, 4 words/texel (8 fp16 halves), linear (y*IN_W+x).
+// Output buffer: uint words, 4 words/texel (16 int8 bytes), low byte = channel 4k.
+// NOTE: no dynamic vector-component or local-array indexing (Adreno driver safety).
+// WEIGHT-ORDER CONTRACT: the call sites below pair
+// c10=(x+1,y+0) with wAt(f,ky=1,kx=0) and c01=(x+0,y+1) with wAt(f,ky=0,kx=1)
+// — TRANSPOSED vs gen_seeds.py's documented layout. The DEPLOYED
+// gpu_data/pass0_wb.raw (md5 0915f25de428aaeee396701e3abfd341, host=device)
+// is in the compensating order, so shader+file match SDK semantics
+// (device-vs-simulator gate: 12/8,294,400 codes, all ±1 LSB). Do NOT
+// regenerate the .raw without reconciling the generator's word order.
+precision highp float;
+precision highp int;
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(std430, binding = 0) readonly buffer InFeats { uint feats[]; };
+layout(std430, binding = 1) writeonly buffer OutQ { uint outq[]; };
+layout(std430, binding = 2) readonly buffer Weights { uint wb[]; }; // 256 weight words then 8 bias words
+
+uniform uint IN_W; // 1920
+uniform uint OUT_W; // 960
+uniform uint OUT_H; // 540
+
+float halfAt(uint word, uint sel) {
+ vec2 v = unpackHalf2x16(word);
+ return (sel == 0u) ? v.x: v.y;
+}
+vec2 feat2(uint x, uint y, uint c2) { // channel PAIR (2*c2, 2*c2+1)
+ return unpackHalf2x16(feats[(y * IN_W + x) * 4u + c2]);
+}
+float featAt(uint x, uint y, uint c) {
+ return halfAt(feats[(y * IN_W + x) * 4u + (c >> 1u)], c & 1u);
+}
+vec2 w2(uint f, uint ky, uint kx, uint c2) { // weight PAIR for tap (ky,kx)
+ return unpackHalf2x16(wb[f * 16u + (ky * 2u + kx) * 4u + c2]);
+}
+float wAt(uint f, uint ky, uint kx, uint c) {
+ return halfAt(wb[f * 16u + (ky * 2u + kx) * 4u + (c >> 1u)], c & 1u);
+}
+float biasAt(uint f) {
+ return halfAt(wb[256u + (f >> 1u)], f & 1u);
+}
+uint pack4(int b0, int b1, int b2, int b3) {
+ return (uint(b0) & 0xffu)
+ | ((uint(b1) & 0xffu) << 8u)
+ | ((uint(b2) & 0xffu) << 16u)
+ | ((uint(b3) & 0xffu) << 24u);
+}
+const float RCP_S = 66.65824; // float32(1/0.015001929) — graph-declared input scale (fix #5)
+int quant1(float acc, float bias) {
+ float v = (acc + bias) * RCP_S;
+ return int(clamp(roundEven(v), -128.0, 127.0));
+}
+
+void main() {
+ uvec2 p = gl_GlobalInvocationID.xy;
+ if (p.x >= OUT_W || p.y >= OUT_H) return;
+
+ uint x0 = 2u * p.x, x1 = 2u * p.x + 1u;
+ uint y0 = 2u * p.y, y1 = 2u * p.y + 1u;
+ /* vec2-pair MACs (2 channels per unpackHalf2x16) — same tap order
+ * as the scalar form per the WEIGHT-ORDER CONTRACT above; only the fp32
+ * add grouping changes (pairwise), within s8-quantization tolerance */
+ vec2 c00[4], c10[4], c01[4], c11[4];
+ for (uint c2 = 0u; c2 < 4u; ++c2) {
+ c00[c2] = feat2(x0, y0, c2);
+ c10[c2] = feat2(x1, y0, c2);
+ c01[c2] = feat2(x0, y1, c2);
+ c11[c2] = feat2(x1, y1, c2);
+ }
+
+ int q[16];
+ for (uint f = 0u; f < 16u; ++f) {
+ vec2 acc = vec2(0.0);
+ acc += w2(f, 0u, 0u, 0u) * c00[0] + w2(f, 0u, 0u, 1u) * c00[1]
+ + w2(f, 0u, 0u, 2u) * c00[2] + w2(f, 0u, 0u, 3u) * c00[3];
+ acc += w2(f, 1u, 0u, 0u) * c10[0] + w2(f, 1u, 0u, 1u) * c10[1]
+ + w2(f, 1u, 0u, 2u) * c10[2] + w2(f, 1u, 0u, 3u) * c10[3];
+ acc += w2(f, 0u, 1u, 0u) * c01[0] + w2(f, 0u, 1u, 1u) * c01[1]
+ + w2(f, 0u, 1u, 2u) * c01[2] + w2(f, 0u, 1u, 3u) * c01[3];
+ acc += w2(f, 1u, 1u, 0u) * c11[0] + w2(f, 1u, 1u, 1u) * c11[1]
+ + w2(f, 1u, 1u, 2u) * c11[2] + w2(f, 1u, 1u, 3u) * c11[3];
+ q[f] = quant1(acc.x + acc.y, biasAt(f));
+ }
+
+ uint base = (p.y * OUT_W + p.x) * 4u;
+ outq[base + 0u] = pack4(q[0], q[1], q[2], q[3]);
+ outq[base + 1u] = pack4(q[4], q[5], q[6], q[7]);
+ outq[base + 2u] = pack4(q[8], q[9], q[10], q[11]);
+ outq[base + 3u] = pack4(q[12], q[13], q[14], q[15]);
+}

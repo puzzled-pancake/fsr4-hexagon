@@ -1,0 +1,166 @@
+// Ported from / derived from AMD FidelityFX SDK compute kernels.
+// Original math (c) AMD, FidelityFX SDK license governs the derived algorithm;
+// the surrounding pipeline is this project's (MIT, see LICENSE).
+#version 310 es
+// postA (design): the CHAIN-CRITICAL half of post_real —
+// everything feat(N+1) depends on: npu decode, recurrent imageStore, the
+// anisotropic 3x3 Gaussian, blend (with floor/black-guard/dist-decay), and
+// the mu-law HISTORY write (SSBO 10). The final-color tail (SSBO7/SSBO11)
+// is dropped: with RCAS on, rcas.comp reads SSBO 10 directly (bit-exact:
+// hist stores raw model_color; rcas clamps >=0 on load — identical to the
+// old max(model_color,0) write). The NPU thread executes frame N while the
+// GL thread runs postA(N-1)+rcas(N-1)+readback(N-1).
+precision highp float;
+precision highp int;
+layout(local_size_x = 8, local_size_y = 8) in;
+
+/* EGL dma-buf import variant (posta_egl.comp) — the NPU output
+ * tensor is read DIRECTLY via imageLoad on the outB dma-buf imported as an
+ * rgba8 texture (3840x1080: 2 texels/px, bytes in order). copy2 dies.
+ * Byte path is pure integer: UNORM fetch returns exactly k/255.0 (spec),
+ * roundEven(v*255) == k exactly (proven on this device), sign-extension
+ * matches sbx — downstream expressions byte-identical => bit-exact. */
+layout(rgba8, binding = 4) readonly uniform highp image2D NpuImg;
+layout(std430, binding = 15) readonly buffer DistD { uint distd[]; }; // compact dist (1 word/px) — replaces binding-0 feats word 4n+1
+layout(std430, binding = 9) readonly buffer Repj { uint rpj[]; }; // fp16 RGBA rectified hist (MU-LAW)
+layout(std430, binding = 10) writeonly buffer Hist { uint hist[]; };// fp16 RGBA mu-law history
+layout(std430, binding = 5) readonly buffer RawLr { uint rawlr[]; }; // raw R11G11B10F (mulr deleted)
+layout(rgba8, binding = 1) writeonly uniform highp image2D u_recimg; /* rec is 8-bit by contract (quantized to k/255 above the store) — RGBA16F was bandwidth waste */
+
+uniform vec4 u_params; // x=exposure, y=jitter.x, z=jitter.y, w=blend floor
+uniform vec4 u_dims; // x=OS_W, y=OS_H, z=LR_W, w=LR_H
+uniform float u_bftau; // chroma-dist scale for floor decay (0 = flat floor)
+uniform float u_expo; /* replaces mulr.comp's bake (was SSBO13) */
+
+const float S_OUT = 0.303211569786;
+
+/* s8ch deleted — dead since the hoist, and it referenced the
+ * removed npu SSBO (compile error on first device build). */
+/* hoist: byte extract from an already-fetched word — identical
+ * semantics to s8ch (same word selection, same sign extension) */
+int sbx(uint w, uint sh) {
+ uint b = (w >> sh) & 0xffu;
+ return (b & 0x80u) != 0u ? int(b) - 256: int(b);
+}
+/* imageLoad'd UNORM component -> the stored u8 byte, sign-extended.
+ * k/255.0 is what UNORM fetch returns (spec-exact); *255 + roundEven is
+ * exact for all k (error <= 255*2^-24 << 0.5; device-proven). */
+int u8sx(float v) {
+ int b = int(roundEven(v * 255.0)) & 0xff;
+ return (b & 0x80) != 0 ? b - 256: b;
+}
+vec3 loadRGB(uint w0, uint w1) {
+ return vec3(unpackHalf2x16(w0), unpackHalf2x16(w1).x);
+}
+vec3 loadRepj(uvec2 p) {
+ uint base = (p.y * uint(u_dims.x) + p.x) * 2u;
+ return loadRGB(rpj[base], rpj[base + 1u]);
+}
+/* raw decode + expo + mu-law with the fp16 round-trip (SSBO13 parity) */
+vec3 muled_raw(uint t) {
+ vec3 c = vec3(unpackHalf2x16((t & 0x7FFu) << 4u).x,
+ unpackHalf2x16(((t >> 11) & 0x7FFu) << 4u).x,
+ unpackHalf2x16(((t >> 22) & 0x3FFu) << 5u).x) * u_expo;
+ vec3 m = max(vec3(0.1174) * log(1.0 + 150.0 * c), vec3(0.0));
+ vec2 xy = unpackHalf2x16(packHalf2x16(m.xy));
+ float z = unpackHalf2x16(packHalf2x16(vec2(m.z, 0.0))).x;
+ return vec3(xy, z);
+}
+/* shared 8x8 LR tile. Origin = the group's minimum rounded LR
+ * tap - 1 (roundEven is monotone in tid; jitter is a uniform) — group tap
+ * span is provably <= 6, so 8 columns/rows cover it with margin. Tile
+ * slot (c,r) holds clamp(origin+(c,r)); for any tap,
+ * tile[clamp(tap)-origin] reproduces loadMulr's clamped fetch bit-for-bit
+ * (clamp(origin + (clampedtap-origin)) == clampedtap).
+ * PRECONDITION: sub-pixel jitter only (|jitter| <~ 1.5 LR px) — a larger
+ * amplitude would need the tile span re-derived. */
+shared uint s_lr[8 * 8 * 2];
+
+void main() {
+ /* FIRST, barrier BEFORE the (dead — dispatch is an exact
+ * 240x135 fit) bounds check: every thread of the group must reach
+ * the barrier or shared-memory access is undefined */
+ vec2 jitter = u_params.yz;
+
+ ivec2 g8 = ivec2(gl_WorkGroupID.xy) * 8;
+ int bc = int(roundEven(-0.25 + float(g8.x) * 0.5 + jitter.x)) - 1;
+ int br = int(roundEven(-0.25 + float(g8.y) * 0.5 + jitter.y)) - 1;
+ for (uint i = gl_LocalInvocationIndex; i < 128u; i += 64u) {
+ uint t = i >> 1; uint w = i & 1u;
+ uint px = uint(clamp(bc + int(t & 7u), 0, int(u_dims.z) - 1));
+ uint py = uint(clamp(br + int(t >> 3u), 0, int(u_dims.w) - 1));
+ /* bake the mu-law pair EXACTLY as mulr.comp wrote it — the LDS
+ * tile holds the same two words SSBO13 held, downstream untouched */
+ uint rt = rawlr[py * uint(u_dims.z) + px];
+ vec3 c = vec3(unpackHalf2x16((rt & 0x7FFu) << 4u).x,
+ unpackHalf2x16(((rt >> 11) & 0x7FFu) << 4u).x,
+ unpackHalf2x16(((rt >> 22) & 0x3FFu) << 5u).x) * u_expo;
+ vec3 m = max(vec3(0.1174) * log(1.0 + 150.0 * c), vec3(0.0));
+ s_lr[i] = (w == 0u) ? packHalf2x16(m.xy): packHalf2x16(vec2(m.z, 1.0));
+ }
+ barrier();
+
+ uvec2 tid = gl_GlobalInvocationID.xy;
+ if (tid.x >= uint(u_dims.x) || tid.y >= uint(u_dims.y)) return;
+
+ /* fetch the 2 npu texels ONCE (byte order == the words' bytes) */
+ vec4 t0 = imageLoad(NpuImg, ivec2(int(tid.x * 2u), int(tid.y)));
+ vec4 t1 = imageLoad(NpuImg, ivec2(int(tid.x * 2u + 1u), int(tid.y)));
+
+ float p0 = float(u8sx(t0.x)) * S_OUT;
+ float p1 = float(u8sx(t0.y)) * S_OUT;
+ float p2 = float(u8sx(t0.z)) * S_OUT;
+ float p3 = float(u8sx(t0.w)) * S_OUT;
+ vec4 rv = vec4(float(u8sx(t1.x)), float(u8sx(t1.y)),
+ float(u8sx(t1.z)), float(u8sx(t1.w))) * S_OUT;
+
+ vec4 rec = vec4(1.0) / (vec4(1.0) + exp2(-rv * 1.4426950409));
+ rec = floor(rec * 255.0 + 0.5) / 255.0; // SDK recurrent is RGBA8
+ imageStore(u_recimg, ivec2(tid), rec);
+
+ float correlation = (exp2(p0 * 1.4426950409) - exp2(-p0 * 1.4426950409)) / (exp2(p0 * 1.4426950409) + exp2(-p0 * 1.4426950409));
+ float sfx = 2.0 / (1.0 + exp2(-p1 * 1.4426950409));
+ float sfy = 2.0 / (1.0 + exp2(-p2 * 1.4426950409));
+
+ vec2 lr_f = vec2(-0.25) + vec2(tid) * 0.5 + jitter;
+ ivec2 lr_i = ivec2(roundEven(lr_f));
+
+ /* gaussian served from the LDS tile — float expression trees
+ * VERBATIM (no reassociation); tap fetches map clamp(tap) -> tile
+ * slot, bit-identical to the old loadMulr path */
+ vec3 up = vec3(0.0);
+ float tw = 0.0;
+ for (int dy = 0; dy < 3; ++dy) {
+ mediump float yd = (float(lr_i.y + dy - 1) - lr_f.y) * 2.0;
+ int ly = clamp(clamp(lr_i.y + dy - 1, 0, int(u_dims.w) - 1) - br, 0, 7);
+ uint rowbase = uint(ly) * 8u * 2u;
+ for (int dx = 0; dx < 3; ++dx) {
+ mediump float xd = (float(lr_i.x + dx - 1) - lr_f.x) * 2.0;
+ mediump float gw = exp2((-0.5 / (0.47 * 0.47)) * 1.4426950409 *
+ (xd * xd * sfx * sfx + 2.0 * correlation * (xd * yd) * sfx * sfy +
+ yd * yd * sfy * sfy));
+ tw += gw;
+ int lx = clamp(clamp(lr_i.x + dx - 1, 0, int(u_dims.z) - 1) - bc, 0, 7);
+ uint idx = rowbase + uint(lx) * 2u;
+ up += vec3(unpackHalf2x16(s_lr[idx]), unpackHalf2x16(s_lr[idx + 1u]).x) * gw;
+ }
+ }
+ up /= tw;
+
+ float blend = 1.0 / (1.0 + exp2(-p3 * 1.4426950409));
+ vec3 rp = loadRepj(tid);
+ float bfloor = u_params.w;
+ if (max(max(rp.r, rp.g), rp.b) <= 0.0) {
+ bfloor = 0.0;
+ } else if (u_bftau > 0.0) {
+ float dist = unpackHalf2x16(distd[tid.y * uint(u_dims.x) + tid.x]).x;
+ bfloor *= clamp(1.0 - dist / u_bftau, 0.0, 1.0);
+ }
+ blend = max(blend, bfloor);
+
+ vec3 model_color = up * (1.0 - blend) + rp * blend;
+
+ uint obase = (tid.y * uint(u_dims.x) + tid.x) * 2u;
+ hist[obase] = packHalf2x16(model_color.xy);
+ hist[obase + 1u] = packHalf2x16(vec2(model_color.z, 1.0));
+}
