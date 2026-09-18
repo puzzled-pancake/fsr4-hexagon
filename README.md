@@ -10,6 +10,8 @@ The full story, methodology and measured results are in
 **[WHITEPAPER.pdf](WHITEPAPER.pdf)** (energy parity with native rendering at
 the light end, +22% fps; every config that undervolted the NPU lost).
 
+> ⚒️ **Support this work:** this was months of reverse-engineering on hardware I bought second-hand. If it's useful to you, [GitHub Sponsors](https://github.com/sponsors/puzzled-pancake) and [Ko-fi](https://ko-fi.com/ratherpuzzled) keep the research going.
+
 ```
 RotTR (Wine/Box64/DXVK)                     Android host
 ┌─────────────────────────┐    TCP loopback  ┌──────────────────────────────┐
